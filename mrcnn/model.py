@@ -15,6 +15,8 @@ import math
 import logging
 from collections import OrderedDict
 import multiprocessing
+
+import cv2
 import numpy as np
 import tensorflow as tf
 import keras
@@ -547,6 +549,10 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     # 2. Negative ROIs are those with < 0.5 with every GT box. Skip crowds.
     negative_indices = tf.where(tf.logical_and(roi_iou_max < 0.5, no_crowd_bool))[:, 0]
 
+    negative_indices = tf.cond(tf.shape(gt_class_ids)[0] > 0,
+                               lambda: negative_indices,
+                               lambda: tf.cast(tf.range(tf.shape(overlaps)[0]), tf.int64))
+
     # Subsample ROIs. Aim for 33% positive
     # Positive ROIs
     positive_count = int(config.TRAIN_ROIS_PER_IMAGE *
@@ -556,6 +562,11 @@ def detection_targets_graph(proposals, gt_class_ids, gt_boxes, gt_masks, config)
     # Negative ROIs. Add enough to maintain positive:negative ratio.
     r = 1.0 / config.ROI_POSITIVE_RATIO
     negative_count = tf.cast(r * tf.cast(positive_count, tf.float32), tf.int32) - positive_count
+
+    negative_count = tf.cond(tf.shape(gt_class_ids)[0] > 0,
+                             lambda: negative_count,
+                             lambda: config.TRAIN_ROIS_PER_IMAGE)
+
     negative_indices = tf.random_shuffle(negative_indices)[:negative_count]
     # Gather selected ROIs
     positive_rois = tf.gather(proposals, positive_indices)
@@ -1115,7 +1126,8 @@ def mrcnn_class_loss_graph(target_class_ids, pred_class_logits,
     """
 
     # Specify which rois in target_class_ids is zero padding or not
-    non_zeros = tf.cast(tf.greater(target_class_ids, 0), 'float32')
+    # non_zeros = tf.cast(tf.greater(target_class_ids, 0), 'float32')
+    non_zeros = tf.cast(tf.math.not_equal(tf.reduce_sum(pred_class_logits, axis=-1), 0), 'float32')
 
     # During model building, Keras calls this function with
     # target_class_ids of type float32. Unclear why. Cast it
@@ -1126,7 +1138,7 @@ def mrcnn_class_loss_graph(target_class_ids, pred_class_logits,
     pred_class_ids = tf.argmax(pred_class_logits, axis=2)
     # TODO: Update this line to work with batch > 1. Right now it assumes all
     #       images in a batch have the same active_class_ids
-    pred_active = tf.gather(active_class_ids[0], pred_class_ids)
+    pred_active = tf.gather(active_class_ids, pred_class_ids, batch_dims=1)
 
     # Loss
     loss = tf.nn.sparse_softmax_cross_entropy_with_logits(
@@ -1276,7 +1288,7 @@ def load_image_gt(dataset, config, image_id, augment=False, augmentation=None,
         # test your augmentation on masks
         MASK_AUGMENTERS = ["Sequential", "SomeOf", "OneOf", "Sometimes",
                            "Fliplr", "Flipud", "CropAndPad",
-                           "Affine", "PiecewiseAffine"]
+                           "Affine", "PiecewiseAffine", "PerspectiveTransform"]
 
         def hook(images, augmenter, parents, default):
             """Determines which augmenters to apply to masks."""
@@ -1321,6 +1333,13 @@ def load_image_gt(dataset, config, image_id, augment=False, augmentation=None,
     # Image meta data
     image_meta = compose_image_meta(image_id, original_shape, image.shape,
                                     window, scale, active_class_ids)
+
+    # img = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    # for b in bbox:
+    #     p1, p2 = (b[1], b[0]), (b[3], b[2])
+    #     cv2.rectangle(img, p1, p2, (255, 0, 0), 2)
+    # cv2.imshow('augmented', img)
+    # cv2.waitKey()
 
     return image, image_meta, class_ids, bbox, mask
 
@@ -2386,7 +2405,7 @@ class MaskRCNN():
         callbacks = [
             keras.callbacks.TensorBoard(log_dir=self.log_dir,
                                         histogram_freq=0, write_graph=True, write_images=False),
-            keras.callbacks.ModelCheckpoint(self.checkpoint_path,
+            keras.callbacks.ModelCheckpoint(self.checkpoint_path, save_best_only=True,
                                             verbose=0, save_weights_only=True),
         ]
 
@@ -2406,7 +2425,8 @@ class MaskRCNN():
         if os.name is 'nt':
             workers = 0
         else:
-            workers = multiprocessing.cpu_count()
+            # workers = multiprocessing.cpu_count()
+            workers = 1
 
         self.keras_model.fit_generator(
             train_generator,
@@ -2416,7 +2436,7 @@ class MaskRCNN():
             callbacks=callbacks,
             validation_data=val_generator,
             validation_steps=self.config.VALIDATION_STEPS,
-            max_queue_size=100,
+            max_queue_size=10,
             workers=workers,
             use_multiprocessing=True,
         )
